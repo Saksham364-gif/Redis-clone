@@ -3,6 +3,7 @@
 #include <vector>
 #include <deque>
 #include <unordered_map>
+#include <chrono>
 #include <cstring>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -16,6 +17,26 @@ const int MAX_LINE_LEN = 64;
 std::unordered_map<std::string, std::string> store;
 std::unordered_map<std::string, std::deque<std::string>> listStore;
 std::unordered_map<std::string, std::unordered_map<std::string, std::string>> hashStore;
+std::unordered_map<std::string, std::chrono::steady_clock::time_point> expiryTimes;
+
+using Clock = std::chrono::steady_clock;
+
+bool isExpired(const std::string& key) {
+    auto it = expiryTimes.find(key);
+    if (it == expiryTimes.end()) return false;
+    if (Clock::now() >= it->second) {
+        store.erase(key);
+        listStore.erase(key);
+        hashStore.erase(key);
+        expiryTimes.erase(it);
+        return true;
+    }
+    return false;
+}
+
+void clearExpiry(const std::string& key) {
+    expiryTimes.erase(key);
+}
 
 struct ParseResult {
     std::vector<std::string> args;
@@ -157,6 +178,10 @@ void handleCommand(int client_fd, std::vector<std::string>& args) {
     std::string cmd = args[0];
     for (auto& ch : cmd) ch = toupper(ch);
 
+    if (cmd != "EXISTS" && args.size() >= 2) {
+        isExpired(args[1]);
+    }
+
     if (cmd == "PING") {
         sendSimpleString(client_fd, "PONG");
     }
@@ -165,6 +190,7 @@ void handleCommand(int client_fd, std::vector<std::string>& args) {
     }
     else if (cmd == "SET" && args.size() >= 3) {
         store[args[1]] = args[2];
+        clearExpiry(args[1]);
         sendSimpleString(client_fd, "OK");
     }
     else if (cmd == "GET" && args.size() >= 2) {
@@ -176,7 +202,34 @@ void handleCommand(int client_fd, std::vector<std::string>& args) {
         int deleted = store.erase(args[1]);
         deleted += listStore.erase(args[1]);
         deleted += hashStore.erase(args[1]);
+        clearExpiry(args[1]);
         sendInteger(client_fd, deleted);
+    }
+    else if (cmd == "EXPIRE" && args.size() >= 3) {
+        bool exists = store.count(args[1]) || listStore.count(args[1]) || hashStore.count(args[1]);
+        if (!exists) { sendInteger(client_fd, 0); return; }
+        long long seconds;
+        try { seconds = std::stoll(args[2]); }
+        catch (...) { sendError(client_fd, "value is not an integer or out of range"); return; }
+        expiryTimes[args[1]] = Clock::now() + std::chrono::seconds(seconds);
+        sendInteger(client_fd, 1);
+    }
+    else if (cmd == "TTL" && args.size() >= 2) {
+        bool exists = store.count(args[1]) || listStore.count(args[1]) || hashStore.count(args[1]);
+        if (!exists) { sendInteger(client_fd, -2); return; }
+        auto it = expiryTimes.find(args[1]);
+        if (it == expiryTimes.end()) { sendInteger(client_fd, -1); return; }
+        auto remaining = std::chrono::duration_cast<std::chrono::seconds>(it->second - Clock::now()).count();
+        sendInteger(client_fd, remaining > 0 ? remaining : 0);
+    }
+    else if (cmd == "PERSIST" && args.size() >= 2) {
+        int removed = expiryTimes.erase(args[1]);
+        sendInteger(client_fd, removed);
+    }
+    else if (cmd == "EXISTS" && args.size() >= 2) {
+        isExpired(args[1]);
+        bool exists = store.count(args[1]) || listStore.count(args[1]) || hashStore.count(args[1]);
+        sendInteger(client_fd, exists ? 1 : 0);
     }
     else if (cmd == "LPUSH" && args.size() >= 3) {
         for (size_t i = 2; i < args.size(); i++) {

@@ -6,13 +6,18 @@
 #include <chrono>
 #include <cstring>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 const int MAX_ARRAY_COUNT = 1024;
 const int MAX_BULK_LEN = 512 * 1024 * 1024;
 const int MAX_LINE_LEN = 64;
+const int MAX_EVENTS = 1024;
+const int READ_CHUNK = 65536;
 
 std::unordered_map<std::string, std::string> store;
 std::unordered_map<std::string, std::deque<std::string>> listStore;
@@ -20,6 +25,14 @@ std::unordered_map<std::string, std::unordered_map<std::string, std::string>> ha
 std::unordered_map<std::string, std::chrono::steady_clock::time_point> expiryTimes;
 
 using Clock = std::chrono::steady_clock;
+
+struct ClientState {
+    std::string inbuf;
+    std::string outbuf;
+    bool wantClose = false;
+};
+
+std::unordered_map<int, ClientState> clients;
 
 bool isExpired(const std::string& key) {
     auto it = expiryTimes.find(key);
@@ -38,141 +51,105 @@ void clearExpiry(const std::string& key) {
     expiryTimes.erase(key);
 }
 
-struct ParseResult {
-    std::vector<std::string> args;
-    bool disconnected = false;
-    bool protocolError = false;
-    std::string errorMsg;
-};
-
-ParseResult parseCommand(int client_fd) {
-    ParseResult result;
-
-    auto readByte = [&](char& out) -> bool {
-        ssize_t n = read(client_fd, &out, 1);
-        return n == 1;
-    };
-
-    auto readLine = [&](std::string& out) -> bool {
-        char ch;
-        out.clear();
-        while (readByte(ch)) {
-            if (ch == '\r') {
-                if (!readByte(ch) || ch != '\n') return false;
-                return true;
-            }
-            out += ch;
-            if (out.size() > MAX_LINE_LEN) return false;
-        }
-        return false;
-    };
-
-    auto parseIntStrict = [](const std::string& s, long long& out) -> bool {
-        if (s.empty()) return false;
-        size_t i = 0;
-        bool neg = false;
-        if (s[0] == '-') { neg = true; i = 1; }
-        if (i >= s.size()) return false;
-        long long val = 0;
-        for (; i < s.size(); i++) {
-            if (!isdigit((unsigned char)s[i])) return false;
-            val = val * 10 + (s[i] - '0');
-        }
-        out = neg ? -val : val;
-        return true;
-    };
-
-    char c;
-    if (!readByte(c)) { result.disconnected = true; return result; }
-
-    if (c != '*') {
-        result.protocolError = true;
-        result.errorMsg = "expected array";
-        return result;
+bool parseIntStrict(const std::string& s, long long& out) {
+    if (s.empty()) return false;
+    size_t i = 0;
+    bool neg = false;
+    if (s[0] == '-') { neg = true; i = 1; }
+    if (i >= s.size()) return false;
+    long long val = 0;
+    for (; i < s.size(); i++) {
+        if (!isdigit((unsigned char)s[i])) return false;
+        val = val * 10 + (s[i] - '0');
     }
+    out = neg ? -val : val;
+    return true;
+}
 
-    std::string countLine;
-    if (!readLine(countLine)) { result.disconnected = true; return result; }
+enum class ParseStatus { OK, INCOMPLETE, ERROR };
 
+ParseStatus tryParseCommand(const std::string& buf, size_t& consumed, std::vector<std::string>& args, std::string& errMsg) {
+    args.clear();
+    size_t pos = 0;
+
+    if (buf.empty()) return ParseStatus::INCOMPLETE;
+    if (buf[pos] != '*') { errMsg = "expected array"; return ParseStatus::ERROR; }
+    pos++;
+
+    size_t lineEnd = buf.find("\r\n", pos);
+    if (lineEnd == std::string::npos) {
+        if (buf.size() - pos > MAX_LINE_LEN) { errMsg = "invalid multibulk length"; return ParseStatus::ERROR; }
+        return ParseStatus::INCOMPLETE;
+    }
+    std::string countStr = buf.substr(pos, lineEnd - pos);
     long long count;
-    if (!parseIntStrict(countLine, count) || count < 0 || count > MAX_ARRAY_COUNT) {
-        result.protocolError = true;
-        result.errorMsg = "invalid multibulk length";
-        return result;
+    if (!parseIntStrict(countStr, count) || count < 0 || count > MAX_ARRAY_COUNT) {
+        errMsg = "invalid multibulk length";
+        return ParseStatus::ERROR;
     }
+    pos = lineEnd + 2;
 
     for (long long i = 0; i < count; i++) {
-        char typeChar;
-        if (!readByte(typeChar)) { result.disconnected = true; return result; }
-        if (typeChar != '$') {
-            result.protocolError = true;
-            result.errorMsg = "expected bulk string";
-            return result;
+        if (pos >= buf.size()) return ParseStatus::INCOMPLETE;
+        if (buf[pos] != '$') { errMsg = "expected bulk string"; return ParseStatus::ERROR; }
+        pos++;
+
+        lineEnd = buf.find("\r\n", pos);
+        if (lineEnd == std::string::npos) {
+            if (buf.size() - pos > MAX_LINE_LEN) { errMsg = "invalid bulk length"; return ParseStatus::ERROR; }
+            return ParseStatus::INCOMPLETE;
         }
-
-        std::string lenLine;
-        if (!readLine(lenLine)) { result.disconnected = true; return result; }
-
+        std::string lenStr = buf.substr(pos, lineEnd - pos);
         long long len;
-        if (!parseIntStrict(lenLine, len) || len < 0 || len > MAX_BULK_LEN) {
-            result.protocolError = true;
-            result.errorMsg = "invalid bulk length";
-            return result;
+        if (!parseIntStrict(lenStr, len) || len < 0 || len > MAX_BULK_LEN) {
+            errMsg = "invalid bulk length";
+            return ParseStatus::ERROR;
         }
+        pos = lineEnd + 2;
 
-        std::string value;
-        value.resize(len);
-        long long totalRead = 0;
-        while (totalRead < len) {
-            ssize_t n = read(client_fd, &value[totalRead], len - totalRead);
-            if (n <= 0) { result.disconnected = true; return result; }
-            totalRead += n;
+        if (pos + (size_t)len + 2 > buf.size()) return ParseStatus::INCOMPLETE;
+
+        std::string value = buf.substr(pos, len);
+        pos += len;
+
+        if (buf[pos] != '\r' || buf[pos + 1] != '\n') {
+            errMsg = "expected CRLF after bulk string";
+            return ParseStatus::ERROR;
         }
+        pos += 2;
 
-        char cr, lf;
-        if (!readByte(cr) || !readByte(lf) || cr != '\r' || lf != '\n') {
-            result.protocolError = true;
-            result.errorMsg = "expected CRLF after bulk string";
-            return result;
-        }
-
-        result.args.push_back(value);
+        args.push_back(value);
     }
 
-    return result;
+    consumed = pos;
+    return ParseStatus::OK;
 }
 
-void sendSimpleString(int fd, const std::string& s) {
-    std::string resp = "+" + s + "\r\n";
-    write(fd, resp.c_str(), resp.size());
+void appendSimpleString(std::string& out, const std::string& s) {
+    out += "+" + s + "\r\n";
 }
 
-void sendError(int fd, const std::string& s) {
-    std::string resp = "-ERR " + s + "\r\n";
-    write(fd, resp.c_str(), resp.size());
+void appendError(std::string& out, const std::string& s) {
+    out += "-ERR " + s + "\r\n";
 }
 
-void sendBulkString(int fd, const std::string& s) {
-    std::string resp = "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
-    write(fd, resp.c_str(), resp.size());
+void appendBulkString(std::string& out, const std::string& s) {
+    out += "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
 }
 
-void sendNull(int fd) {
-    std::string resp = "$-1\r\n";
-    write(fd, resp.c_str(), resp.size());
+void appendNull(std::string& out) {
+    out += "$-1\r\n";
 }
 
-void sendInteger(int fd, long long val) {
-    std::string resp = ":" + std::to_string(val) + "\r\n";
-    write(fd, resp.c_str(), resp.size());
+void appendInteger(std::string& out, long long val) {
+    out += ":" + std::to_string(val) + "\r\n";
 }
 
-void sendArrayHeader(int fd, int count) {
-    std::string resp = "*" + std::to_string(count) + "\r\n";
-    write(fd, resp.c_str(), resp.size());
+void appendArrayHeader(std::string& out, int count) {
+    out += "*" + std::to_string(count) + "\r\n";
 }
 
-void handleCommand(int client_fd, std::vector<std::string>& args) {
+void handleCommand(std::string& out, std::vector<std::string>& args) {
     if (args.empty()) return;
 
     std::string cmd = args[0];
@@ -183,97 +160,81 @@ void handleCommand(int client_fd, std::vector<std::string>& args) {
     }
 
     if (cmd == "PING") {
-        sendSimpleString(client_fd, "PONG");
+        appendSimpleString(out, "PONG");
     }
     else if (cmd == "ECHO" && args.size() >= 2) {
-        sendBulkString(client_fd, args[1]);
+        appendBulkString(out, args[1]);
     }
     else if (cmd == "SET" && args.size() >= 3) {
         store[args[1]] = args[2];
         clearExpiry(args[1]);
-        sendSimpleString(client_fd, "OK");
+        appendSimpleString(out, "OK");
     }
     else if (cmd == "GET" && args.size() >= 2) {
         auto it = store.find(args[1]);
-        if (it == store.end()) sendNull(client_fd);
-        else sendBulkString(client_fd, it->second);
+        if (it == store.end()) appendNull(out);
+        else appendBulkString(out, it->second);
     }
     else if (cmd == "DEL" && args.size() >= 2) {
         int deleted = store.erase(args[1]);
         deleted += listStore.erase(args[1]);
         deleted += hashStore.erase(args[1]);
         clearExpiry(args[1]);
-        sendInteger(client_fd, deleted);
+        appendInteger(out, deleted);
     }
     else if (cmd == "EXPIRE" && args.size() >= 3) {
         bool exists = store.count(args[1]) || listStore.count(args[1]) || hashStore.count(args[1]);
-        if (!exists) { sendInteger(client_fd, 0); return; }
+        if (!exists) { appendInteger(out, 0); return; }
         long long seconds;
-        try { seconds = std::stoll(args[2]); }
-        catch (...) { sendError(client_fd, "value is not an integer or out of range"); return; }
+        if (!parseIntStrict(args[2], seconds)) { appendError(out, "value is not an integer or out of range"); return; }
         expiryTimes[args[1]] = Clock::now() + std::chrono::seconds(seconds);
-        sendInteger(client_fd, 1);
+        appendInteger(out, 1);
     }
     else if (cmd == "TTL" && args.size() >= 2) {
         bool exists = store.count(args[1]) || listStore.count(args[1]) || hashStore.count(args[1]);
-        if (!exists) { sendInteger(client_fd, -2); return; }
+        if (!exists) { appendInteger(out, -2); return; }
         auto it = expiryTimes.find(args[1]);
-        if (it == expiryTimes.end()) { sendInteger(client_fd, -1); return; }
+        if (it == expiryTimes.end()) { appendInteger(out, -1); return; }
         auto remaining = std::chrono::duration_cast<std::chrono::seconds>(it->second - Clock::now()).count();
-        sendInteger(client_fd, remaining > 0 ? remaining : 0);
+        appendInteger(out, remaining > 0 ? remaining : 0);
     }
     else if (cmd == "PERSIST" && args.size() >= 2) {
         int removed = expiryTimes.erase(args[1]);
-        sendInteger(client_fd, removed);
+        appendInteger(out, removed);
     }
     else if (cmd == "EXISTS" && args.size() >= 2) {
         isExpired(args[1]);
         bool exists = store.count(args[1]) || listStore.count(args[1]) || hashStore.count(args[1]);
-        sendInteger(client_fd, exists ? 1 : 0);
+        appendInteger(out, exists ? 1 : 0);
     }
     else if (cmd == "LPUSH" && args.size() >= 3) {
-        for (size_t i = 2; i < args.size(); i++) {
-            listStore[args[1]].push_front(args[i]);
-        }
-        sendInteger(client_fd, listStore[args[1]].size());
+        for (size_t i = 2; i < args.size(); i++) listStore[args[1]].push_front(args[i]);
+        appendInteger(out, listStore[args[1]].size());
     }
     else if (cmd == "RPUSH" && args.size() >= 3) {
-        for (size_t i = 2; i < args.size(); i++) {
-            listStore[args[1]].push_back(args[i]);
-        }
-        sendInteger(client_fd, listStore[args[1]].size());
+        for (size_t i = 2; i < args.size(); i++) listStore[args[1]].push_back(args[i]);
+        appendInteger(out, listStore[args[1]].size());
     }
     else if (cmd == "LLEN" && args.size() >= 2) {
         auto it = listStore.find(args[1]);
-        sendInteger(client_fd, it == listStore.end() ? 0 : it->second.size());
+        appendInteger(out, it == listStore.end() ? 0 : it->second.size());
     }
     else if (cmd == "LRANGE" && args.size() >= 4) {
         auto it = listStore.find(args[1]);
-        if (it == listStore.end()) {
-            sendArrayHeader(client_fd, 0);
-            return;
-        }
+        if (it == listStore.end()) { appendArrayHeader(out, 0); return; }
         auto& lst = it->second;
         int len = lst.size();
-        int start, stop;
-        try {
-            start = std::stoi(args[2]);
-            stop = std::stoi(args[3]);
-        } catch (...) {
-            sendError(client_fd, "value is not an integer or out of range");
+        long long start, stop;
+        if (!parseIntStrict(args[2], start) || !parseIntStrict(args[3], stop)) {
+            appendError(out, "value is not an integer or out of range");
             return;
         }
-        if (start < 0) start = std::max(0, len + start);
+        if (start < 0) start = std::max((long long)0, len + start);
         if (stop < 0) stop = len + stop;
         if (stop >= len) stop = len - 1;
-        if (start > stop || len == 0) {
-            sendArrayHeader(client_fd, 0);
-            return;
-        }
-        sendArrayHeader(client_fd, stop - start + 1);
-        for (int i = start; i <= stop; i++) {
-            sendBulkString(client_fd, lst[i]);
-        }
+        if (start > stop || len == 0) { appendArrayHeader(out, 0); return; }
+        appendArrayHeader(out, stop - start + 1);
+        for (long long i = start; i <= stop; i++) appendBulkString(out, lst[i]);
     }
     else if (cmd == "HSET" && args.size() >= 4) {
         int added = 0;
@@ -281,36 +242,35 @@ void handleCommand(int client_fd, std::vector<std::string>& args) {
             if (hashStore[args[1]].find(args[i]) == hashStore[args[1]].end()) added++;
             hashStore[args[1]][args[i]] = args[i + 1];
         }
-        sendInteger(client_fd, added);
+        appendInteger(out, added);
     }
     else if (cmd == "HGET" && args.size() >= 3) {
         auto it = hashStore.find(args[1]);
-        if (it == hashStore.end()) { sendNull(client_fd); return; }
+        if (it == hashStore.end()) { appendNull(out); return; }
         auto fit = it->second.find(args[2]);
-        if (fit == it->second.end()) sendNull(client_fd);
-        else sendBulkString(client_fd, fit->second);
+        if (fit == it->second.end()) appendNull(out);
+        else appendBulkString(out, fit->second);
     }
     else if (cmd == "HGETALL" && args.size() >= 2) {
         auto it = hashStore.find(args[1]);
-        if (it == hashStore.end()) {
-            sendArrayHeader(client_fd, 0);
-            return;
-        }
-        sendArrayHeader(client_fd, it->second.size() * 2);
-        for (auto& kv : it->second) {
-            sendBulkString(client_fd, kv.first);
-            sendBulkString(client_fd, kv.second);
-        }
+        if (it == hashStore.end()) { appendArrayHeader(out, 0); return; }
+        appendArrayHeader(out, it->second.size() * 2);
+        for (auto& kv : it->second) { appendBulkString(out, kv.first); appendBulkString(out, kv.second); }
     }
     else if (cmd == "HDEL" && args.size() >= 3) {
         auto it = hashStore.find(args[1]);
-        if (it == hashStore.end()) { sendInteger(client_fd, 0); return; }
+        if (it == hashStore.end()) { appendInteger(out, 0); return; }
         int deleted = it->second.erase(args[2]);
-        sendInteger(client_fd, deleted);
+        appendInteger(out, deleted);
     }
     else {
-        sendError(client_fd, "unknown command '" + cmd + "'");
+        appendError(out, "unknown command '" + cmd + "'");
     }
+}
+
+void setNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 int main() {
@@ -328,37 +288,110 @@ int main() {
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
         std::cerr << "Bind failed\n"; return 1;
     }
-    if (listen(server_fd, 10) < 0) {
+    if (listen(server_fd, 128) < 0) {
         std::cerr << "Listen failed\n"; return 1;
     }
+    setNonBlocking(server_fd);
 
-    std::cout << "my-redis listening on 127.0.0.1:6380...\n";
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) { std::cerr << "epoll_create1 failed\n"; return 1; }
+
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+
+    std::cout << "my-redis (epoll) listening on 127.0.0.1:6380...\n";
+
+    std::vector<epoll_event> events(MAX_EVENTS);
 
     while (true) {
-        sockaddr_in client_address{};
-        socklen_t client_len = sizeof(client_address);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_address, &client_len);
-        if (client_fd < 0) { std::cerr << "Accept failed\n"; continue; }
+        int n = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, -1);
+        if (n < 0) continue;
 
-        std::cout << "Client connected: " << inet_ntoa(client_address.sin_addr) << "\n";
+        for (int i = 0; i < n; i++) {
+            int fd = events[i].data.fd;
 
-        while (true) {
-            ParseResult result = parseCommand(client_fd);
+            if (fd == server_fd) {
+                while (true) {
+                    sockaddr_in client_addr{};
+                    socklen_t client_len = sizeof(client_addr);
+                    int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+                    if (client_fd < 0) break;
 
-            if (result.disconnected) {
-                std::cout << "Client disconnected\n";
-                break;
+                    setNonBlocking(client_fd);
+                    int one = 1;
+                    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+                    epoll_event cev{};
+                    cev.events = EPOLLIN;
+                    cev.data.fd = client_fd;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &cev);
+
+                    clients[client_fd] = ClientState{};
+                }
+                continue;
             }
 
-            if (result.protocolError) {
-                sendError(client_fd, "Protocol error: " + result.errorMsg);
-                break;
+            auto cit = clients.find(fd);
+            if (cit == clients.end()) continue;
+            ClientState& state = cit->second;
+
+            if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                close(fd);
+                clients.erase(fd);
+                continue;
             }
 
-            handleCommand(client_fd, result.args);
+            if (events[i].events & EPOLLIN) {
+                char buf[READ_CHUNK];
+                bool shouldClose = false;
+                while (true) {
+                    ssize_t r = read(fd, buf, sizeof(buf));
+                    if (r > 0) {
+                        state.inbuf.append(buf, r);
+                        if (r < (ssize_t)sizeof(buf)) break;
+                    } else if (r == 0) {
+                        shouldClose = true;
+                        break;
+                    } else {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        shouldClose = true;
+                        break;
+                    }
+                }
+
+                while (true) {
+                    size_t consumed;
+                    std::vector<std::string> args;
+                    std::string errMsg;
+                    ParseStatus status = tryParseCommand(state.inbuf, consumed, args, errMsg);
+
+                    if (status == ParseStatus::INCOMPLETE) break;
+
+                    if (status == ParseStatus::ERROR) {
+                        appendError(state.outbuf, "Protocol error: " + errMsg);
+                        shouldClose = true;
+                        break;
+                    }
+
+                    handleCommand(state.outbuf, args);
+                    state.inbuf.erase(0, consumed);
+                }
+
+                if (!state.outbuf.empty()) {
+                    ssize_t w = write(fd, state.outbuf.data(), state.outbuf.size());
+                    if (w > 0) state.outbuf.erase(0, w);
+                }
+
+                if (shouldClose) {
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+                    close(fd);
+                    clients.erase(fd);
+                }
+            }
         }
-
-        close(client_fd);
     }
 
     close(server_fd);

@@ -8,7 +8,7 @@
 std::string requirePass = "";
 
 const std::set<std::string> WRITE_COMMANDS = {
-    "SET", "DEL", "LPUSH", "RPUSH", "HSET", "HDEL", "EXPIRE", "PERSIST"
+    "SET", "DEL", "LPUSH", "RPUSH", "HSET", "HDEL", "EXPIRE", "PERSIST", "SADD", "SREM"
 };
 
 void handleCommand(std::string& out, std::vector<std::string>& args, ClientState& client, bool fromAOF) {
@@ -66,6 +66,7 @@ void handleCommand(std::string& out, std::vector<std::string>& args, ClientState
         int deleted = store.erase(args[1]);
         deleted += listStore.erase(args[1]);
         deleted += hashStore.erase(args[1]);
+        deleted += setStore.erase(args[1]);
         clearExpiry(args[1]);
         appendInteger(out, deleted);
     }
@@ -146,6 +147,37 @@ void handleCommand(std::string& out, std::vector<std::string>& args, ClientState
         if (it == hashStore.end()) { appendInteger(out, 0); return; }
         int deleted = it->second.erase(args[2]);
         appendInteger(out, deleted);
+    }
+    else if (cmd == "SADD" && args.size() >= 3) {
+        int added = 0;
+        for (size_t i = 2; i < args.size(); i++) {
+            if (setStore[args[1]].insert(args[i]).second) added++;
+        }
+        appendInteger(out, added);
+    }
+    else if (cmd == "SMEMBERS" && args.size() >= 2) {
+        auto it = setStore.find(args[1]);
+        if (it == setStore.end()) { appendArrayHeader(out, 0); return; }
+        appendArrayHeader(out, it->second.size());
+        for (auto& member : it->second) appendBulkString(out, member);
+    }
+    else if (cmd == "SREM" && args.size() >= 3) {
+        auto it = setStore.find(args[1]);
+        if (it == setStore.end()) { appendInteger(out, 0); return; }
+        int removed = 0;
+        for (size_t i = 2; i < args.size(); i++) {
+            removed += it->second.erase(args[i]);
+        }
+        appendInteger(out, removed);
+    }
+    else if (cmd == "SISMEMBER" && args.size() >= 3) {
+        auto it = setStore.find(args[1]);
+        if (it == setStore.end()) { appendInteger(out, 0); return; }
+        appendInteger(out, it->second.count(args[2]) ? 1 : 0);
+    }
+    else if (cmd == "SCARD" && args.size() >= 2) {
+        auto it = setStore.find(args[1]);
+        appendInteger(out, it == setStore.end() ? 0 : it->second.size());
     }
     else {
         appendError(out, "unknown command '" + cmd + "'");

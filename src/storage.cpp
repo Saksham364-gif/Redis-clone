@@ -3,6 +3,7 @@
 std::unordered_map<std::string, std::string> store;
 std::unordered_map<std::string, std::deque<std::string>> listStore;
 std::unordered_map<std::string, std::unordered_map<std::string, std::string>> hashStore;
+std::unordered_map<std::string, std::unordered_set<std::string>> setStore;
 std::unordered_map<std::string, Clock::time_point> expiryTimes;
 
 bool isExpired(const std::string& key) {
@@ -12,6 +13,7 @@ bool isExpired(const std::string& key) {
         store.erase(key);
         listStore.erase(key);
         hashStore.erase(key);
+        setStore.erase(key);
         expiryTimes.erase(it);
         return true;
     }
@@ -23,5 +25,5 @@ void clearExpiry(const std::string& key) {
 }
 
 bool keyExists(const std::string& key) {
-    return store.count(key) || listStore.count(key) || hashStore.count(key);
+    return store.count(key) || listStore.count(key) || hashStore.count(key) || setStore.count(key);
 }

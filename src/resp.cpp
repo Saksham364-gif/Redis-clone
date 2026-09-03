@@ -19,12 +19,39 @@ bool parseIntStrict(const std::string& s, long long& out) {
     return true;
 }
 
+ParseStatus tryParseInlineCommand(const std::string& buf, size_t& consumed, std::vector<std::string>& args, std::string& errMsg) {
+    args.clear();
+    size_t lineEnd = buf.find("\n");
+    if (lineEnd == std::string::npos) {
+        if (buf.size() > 65536) { errMsg = "inline command too long"; return ParseStatus::ERROR; }
+        return ParseStatus::INCOMPLETE;
+    }
+    size_t realEnd = lineEnd;
+    if (realEnd > 0 && buf[realEnd - 1] == '\r') realEnd--;
+
+    std::string line = buf.substr(0, realEnd);
+    consumed = lineEnd + 1;
+
+    size_t i = 0;
+    while (i < line.size()) {
+        while (i < line.size() && isspace((unsigned char)line[i])) i++;
+        if (i >= line.size()) break;
+        size_t start = i;
+        while (i < line.size() && !isspace((unsigned char)line[i])) i++;
+        args.push_back(line.substr(start, i - start));
+    }
+
+    return ParseStatus::OK;
+}
+
 ParseStatus tryParseCommand(const std::string& buf, size_t& consumed, std::vector<std::string>& args, std::string& errMsg) {
     args.clear();
     size_t pos = 0;
 
     if (buf.empty()) return ParseStatus::INCOMPLETE;
-    if (buf[pos] != '*') { errMsg = "expected array"; return ParseStatus::ERROR; }
+    if (buf[pos] != '*') {
+        return tryParseInlineCommand(buf, consumed, args, errMsg);
+    }
     pos++;
 
     size_t lineEnd = buf.find("\r\n", pos);

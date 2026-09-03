@@ -5,6 +5,7 @@
 enum class ParseStatus { OK, INCOMPLETE, ERROR };
 
 bool parseIntStrict(const std::string& s, long long& out);
+ParseStatus tryParseInlineCommand(const std::string& buf, size_t& consumed, std::vector<std::string>& args, std::string& errMsg);
 ParseStatus tryParseCommand(const std::string& buf, size_t& consumed, std::vector<std::string>& args, std::string& errMsg);
 std::string encodeCommand(const std::vector<std::string>& args);
 

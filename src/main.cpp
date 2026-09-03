@@ -1,7 +1,9 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <deque>
+#include <set>
 #include <unordered_map>
 #include <chrono>
 #include <cstring>
@@ -18,18 +20,26 @@ const int MAX_BULK_LEN = 512 * 1024 * 1024;
 const int MAX_LINE_LEN = 64;
 const int MAX_EVENTS = 1024;
 const int READ_CHUNK = 65536;
+const std::string AOF_FILE = "appendonly.aof";
 
 std::unordered_map<std::string, std::string> store;
 std::unordered_map<std::string, std::deque<std::string>> listStore;
 std::unordered_map<std::string, std::unordered_map<std::string, std::string>> hashStore;
 std::unordered_map<std::string, std::chrono::steady_clock::time_point> expiryTimes;
 
+std::string requirePass = "";
+std::ofstream aofStream;
+
+const std::set<std::string> WRITE_COMMANDS = {
+    "SET", "DEL", "LPUSH", "RPUSH", "HSET", "HDEL", "EXPIRE", "PERSIST"
+};
+
 using Clock = std::chrono::steady_clock;
 
 struct ClientState {
     std::string inbuf;
     std::string outbuf;
-    bool wantClose = false;
+    bool authenticated = false;
 };
 
 std::unordered_map<int, ClientState> clients;
@@ -125,38 +135,60 @@ ParseStatus tryParseCommand(const std::string& buf, size_t& consumed, std::vecto
     return ParseStatus::OK;
 }
 
-void appendSimpleString(std::string& out, const std::string& s) {
-    out += "+" + s + "\r\n";
+std::string encodeCommand(const std::vector<std::string>& args) {
+    std::string out = "*" + std::to_string(args.size()) + "\r\n";
+    for (auto& a : args) {
+        out += "$" + std::to_string(a.size()) + "\r\n" + a + "\r\n";
+    }
+    return out;
 }
 
-void appendError(std::string& out, const std::string& s) {
-    out += "-ERR " + s + "\r\n";
+void appendSimpleString(std::string& out, const std::string& s) { out += "+" + s + "\r\n"; }
+void appendError(std::string& out, const std::string& s) { out += "-ERR " + s + "\r\n"; }
+void appendBulkString(std::string& out, const std::string& s) { out += "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n"; }
+void appendNull(std::string& out) { out += "$-1\r\n"; }
+void appendInteger(std::string& out, long long val) { out += ":" + std::to_string(val) + "\r\n"; }
+void appendArrayHeader(std::string& out, int count) { out += "*" + std::to_string(count) + "\r\n"; }
+
+void writeToAOF(std::vector<std::string>& args) {
+    if (!aofStream.is_open()) return;
+    aofStream << encodeCommand(args);
+    aofStream.flush();
 }
 
-void appendBulkString(std::string& out, const std::string& s) {
-    out += "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
-}
-
-void appendNull(std::string& out) {
-    out += "$-1\r\n";
-}
-
-void appendInteger(std::string& out, long long val) {
-    out += ":" + std::to_string(val) + "\r\n";
-}
-
-void appendArrayHeader(std::string& out, int count) {
-    out += "*" + std::to_string(count) + "\r\n";
-}
-
-void handleCommand(std::string& out, std::vector<std::string>& args) {
+void handleCommand(std::string& out, std::vector<std::string>& args, ClientState& client, bool fromAOF = false) {
     if (args.empty()) return;
 
     std::string cmd = args[0];
     for (auto& ch : cmd) ch = toupper(ch);
 
+    if (!fromAOF) {
+        if (!requirePass.empty() && !client.authenticated) {
+            if (cmd == "AUTH") {
+                if (args.size() >= 2 && args[1] == requirePass) {
+                    client.authenticated = true;
+                    appendSimpleString(out, "OK");
+                } else {
+                    appendError(out, "invalid password");
+                }
+                return;
+            }
+            if (cmd == "QUIT") { appendSimpleString(out, "OK"); return; }
+            appendError(out, "NOAUTH Authentication required.");
+            return;
+        }
+        if (cmd == "AUTH") {
+            appendError(out, "Client sent AUTH, but no password is set.");
+            return;
+        }
+    }
+
     if (cmd != "EXISTS" && args.size() >= 2) {
         isExpired(args[1]);
+    }
+
+    if (!fromAOF && WRITE_COMMANDS.count(cmd)) {
+        writeToAOF(args);
     }
 
     if (cmd == "PING") {
@@ -268,12 +300,44 @@ void handleCommand(std::string& out, std::vector<std::string>& args) {
     }
 }
 
+void loadAOF() {
+    std::ifstream in(AOF_FILE, std::ios::binary);
+    if (!in.is_open()) return;
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t consumed;
+        std::vector<std::string> args;
+        std::string errMsg;
+        std::string remaining = content.substr(pos);
+        ParseStatus status = tryParseCommand(remaining, consumed, args, errMsg);
+        if (status != ParseStatus::OK) break;
+        std::string dummy;
+        ClientState dummyClient;
+        dummyClient.authenticated = true;
+        handleCommand(dummy, args, dummyClient, true);
+        pos += consumed;
+    }
+    std::cout << "Loaded " << pos << " bytes from AOF\n";
+}
+
 void setNonBlocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--requirepass" && i + 1 < argc) {
+            requirePass = argv[i + 1];
+        }
+    }
+
+    loadAOF();
+    aofStream.open(AOF_FILE, std::ios::app | std::ios::binary);
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { std::cerr << "Failed to create socket\n"; return 1; }
 
@@ -301,7 +365,7 @@ int main() {
     ev.data.fd = server_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
 
-    std::cout << "my-redis (epoll) listening on 127.0.0.1:6380...\n";
+    std::cout << "my-redis (epoll) listening on 127.0.0.1:6380..." << (requirePass.empty() ? " (no auth)" : " (auth required)") << "\n";
 
     std::vector<epoll_event> events(MAX_EVENTS);
 
@@ -328,7 +392,9 @@ int main() {
                     cev.data.fd = client_fd;
                     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &cev);
 
-                    clients[client_fd] = ClientState{};
+                    ClientState newClient;
+                    newClient.authenticated = requirePass.empty();
+                    clients[client_fd] = newClient;
                 }
                 continue;
             }
@@ -376,7 +442,7 @@ int main() {
                         break;
                     }
 
-                    handleCommand(state.outbuf, args);
+                    handleCommand(state.outbuf, args, state);
                     state.inbuf.erase(0, consumed);
                 }
 

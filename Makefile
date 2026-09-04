@@ -1,6 +1,6 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -Wall -O2 -Iinclude
-SRCS = src/server.cpp src/resp.cpp src/storage.cpp src/commands.cpp src/persistence.cpp
+SRCS = src/server.cpp src/resp.cpp src/storage.cpp src/commands.cpp src/persistence.cpp src/pubsub.cpp
 TARGET = my_redis_server
 
 all:

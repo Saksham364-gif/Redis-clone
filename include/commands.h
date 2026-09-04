@@ -10,4 +10,4 @@ struct ClientState {
 
 extern std::string requirePass;
 
-void handleCommand(std::string& out, std::vector<std::string>& args, ClientState& client, bool fromAOF = false);
+void handleCommand(std::string& out, std::vector<std::string>& args, ClientState& client, int fd, bool fromAOF = false);

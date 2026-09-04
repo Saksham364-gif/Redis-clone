@@ -2,6 +2,7 @@
 #include "storage.h"
 #include "commands.h"
 #include "persistence.h"
+#include "pubsub.h"
 #include <iostream>
 #include <cstdlib>
 #include <unordered_map>
@@ -115,6 +116,7 @@ int main(int argc, char* argv[]) {
             if (events[i].events & (EPOLLHUP | EPOLLERR)) {
                 epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
+                pubsubUnsubscribeAll(fd);
                 clients.erase(fd);
                 continue;
             }
@@ -151,7 +153,7 @@ int main(int argc, char* argv[]) {
                         break;
                     }
 
-                    handleCommand(state.outbuf, args, state);
+                    handleCommand(state.outbuf, args, state, fd);
                     state.inbuf.erase(0, consumed);
                 }
 
@@ -163,6 +165,7 @@ int main(int argc, char* argv[]) {
                 if (shouldClose) {
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
+                    pubsubUnsubscribeAll(fd);
                     clients.erase(fd);
                 }
             }

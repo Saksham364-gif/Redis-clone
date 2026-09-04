@@ -19,11 +19,9 @@ bool isExpired(const std::string& key) {
     }
     return false;
 }
-
 void clearExpiry(const std::string& key) {
     expiryTimes.erase(key);
 }
-
 bool keyExists(const std::string& key) {
     return store.count(key) || listStore.count(key) || hashStore.count(key) || setStore.count(key);
 }

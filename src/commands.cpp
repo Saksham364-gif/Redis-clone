@@ -2,6 +2,7 @@
 #include "resp.h"
 #include "storage.h"
 #include "persistence.h"
+#include "pubsub.h"
 #include <set>
 #include <cctype>
 
@@ -11,11 +12,21 @@ const std::set<std::string> WRITE_COMMANDS = {
     "SET", "DEL", "LPUSH", "RPUSH", "HSET", "HDEL", "EXPIRE", "PERSIST", "SADD", "SREM"
 };
 
-void handleCommand(std::string& out, std::vector<std::string>& args, ClientState& client, bool fromAOF) {
+void handleCommand(std::string& out, std::vector<std::string>& args, ClientState& client, int fd, bool fromAOF) {
     if (args.empty()) return;
 
     std::string cmd = args[0];
     for (auto& ch : cmd) ch = toupper(ch);
+
+    if (!fromAOF && pubsubSubscriptionCount(fd) > 0) {
+        static const std::set<std::string> ALLOWED_IN_SUBSCRIBE_MODE = {
+            "SUBSCRIBE", "UNSUBSCRIBE", "PING", "QUIT"
+        };
+        if (!ALLOWED_IN_SUBSCRIBE_MODE.count(cmd)) {
+            appendError(out, "only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context");
+            return;
+        }
+    }
 
     if (!fromAOF) {
         if (!requirePass.empty() && !client.authenticated) {
@@ -178,6 +189,36 @@ void handleCommand(std::string& out, std::vector<std::string>& args, ClientState
     else if (cmd == "SCARD" && args.size() >= 2) {
         auto it = setStore.find(args[1]);
         appendInteger(out, it == setStore.end() ? 0 : it->second.size());
+    }
+    else if (cmd == "SUBSCRIBE" && args.size() >= 2 && !fromAOF) {
+        for (size_t i = 1; i < args.size(); i++) {
+            pubsubSubscribe(fd, args[i]);
+            appendArrayHeader(out, 3);
+            appendBulkString(out, "subscribe");
+            appendBulkString(out, args[i]);
+            appendInteger(out, pubsubSubscriptionCount(fd));
+        }
+    }
+    else if (cmd == "UNSUBSCRIBE" && !fromAOF) {
+        if (args.size() >= 2) {
+            for (size_t i = 1; i < args.size(); i++) {
+                pubsubUnsubscribe(fd, args[i]);
+                appendArrayHeader(out, 3);
+                appendBulkString(out, "unsubscribe");
+                appendBulkString(out, args[i]);
+                appendInteger(out, pubsubSubscriptionCount(fd));
+            }
+        } else {
+            pubsubUnsubscribeAll(fd);
+            appendArrayHeader(out, 3);
+            appendBulkString(out, "unsubscribe");
+            appendNull(out);
+            appendInteger(out, 0);
+        }
+    }
+    else if (cmd == "PUBLISH" && args.size() >= 3) {
+        int delivered = pubsubPublish(args[1], args[2]);
+        appendInteger(out, delivered);
     }
     else {
         appendError(out, "unknown command '" + cmd + "'");

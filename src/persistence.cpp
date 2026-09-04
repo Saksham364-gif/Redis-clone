@@ -30,7 +30,7 @@ void loadAOF() {
         std::string dummy;
         ClientState dummyClient;
         dummyClient.authenticated = true;
-        handleCommand(dummy, args, dummyClient, true);
+        handleCommand(dummy, args, dummyClient, -1, true);
         pos += consumed;
     }
     std::cout << "Loaded " << pos << " bytes from AOF\n";

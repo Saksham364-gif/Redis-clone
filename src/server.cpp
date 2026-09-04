@@ -3,6 +3,7 @@
 #include "commands.h"
 #include "persistence.h"
 #include <iostream>
+#include <cstdlib>
 #include <unordered_map>
 #include <unistd.h>
 #include <fcntl.h>
@@ -23,9 +24,23 @@ void setNonBlocking(int fd) {
 }
 
 int main(int argc, char* argv[]) {
+    const char* envPass = std::getenv("REDIS_PASSWORD");
+    if (envPass != nullptr) {
+        requirePass = envPass;
+    }
+
+    std::string bindAddr = "127.0.0.1";
+    const char* envBind = std::getenv("REDIS_BIND");
+    if (envBind != nullptr) {
+        bindAddr = envBind;
+    }
+
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--requirepass" && i + 1 < argc) {
             requirePass = argv[i + 1];
+        }
+        if (std::string(argv[i]) == "--bind" && i + 1 < argc) {
+            bindAddr = argv[i + 1];
         }
     }
 
@@ -40,7 +55,7 @@ int main(int argc, char* argv[]) {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = inet_addr("127.0.0.1");
+    address.sin_addr.s_addr = inet_addr(bindAddr.c_str());
     address.sin_port = htons(6380);
 
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
@@ -59,7 +74,7 @@ int main(int argc, char* argv[]) {
     ev.data.fd = server_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
 
-    std::cout << "my-redis (epoll) listening on 127.0.0.1:6380..." << (requirePass.empty() ? " (no auth)" : " (auth required)") << "\n";
+    std::cout << "my-redis (epoll) listening on " << bindAddr << ":6380..." << (requirePass.empty() ? " (no auth)" : " (auth required)") << "\n";
 
     std::vector<epoll_event> events(MAX_EVENTS);
 
